@@ -2,128 +2,129 @@ import requests
 from bs4 import BeautifulSoup
 import re
 
-# Список соцсетей и email-доменов, которые игнорируем
 SOCIAL_MEDIA_DOMAINS = ["facebook.com", "instagram.com", "youtube.com"]
 EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_PATTERN = re.compile(r"\+?[\d\s().-]{9,}\d")
 
-# Функция проверки, является ли ссылка ненужной (соцсети, #, email)
 def is_invalid_link(url):
-    return (
-        any(domain in url for domain in SOCIAL_MEDIA_DOMAINS) or
-        url.endswith("#") or
-        EMAIL_PATTERN.match(url)  # Проверка на email
-    )
+    return any(domain in url for domain in SOCIAL_MEDIA_DOMAINS) or url.endswith("#") or EMAIL_PATTERN.match(url)
 
-# Функция для парсинга страницы федерации
+def extract_info_from_section(section, keyword):
+    if not section:
+        return None
+    element = section.find(string=re.compile(rf'\b{keyword}\b', re.I))
+    if element:
+        parent = element.parent
+        parts = re.split(rf'{keyword}:?', parent.get_text(), flags=re.I)
+        if len(parts) > 1:
+            return parts[1].strip()
+    return None
+
+def extract_kazakhstan_info(kz_section):
+    if not kz_section:
+        return None, set(), None
+
+    address = extract_info_from_section(kz_section, r'Юридический адрес')
+    phones = set()
+    phone_tags = kz_section.find_all(string=re.compile(r'Тел\.|Phone:', re.I))
+    for tag in phone_tags:
+        phones.update(PHONE_PATTERN.findall(tag))
+    
+    website = None
+    site_tag = kz_section.find('a', href=True, string=re.compile(r'Веб-сайт|Website', re.I))
+    if site_tag:
+        website = site_tag['href']
+    else:
+        site_tag = kz_section.find(string=re.compile(r'Веб-сайт|Website', re.I))
+        if site_tag:
+            website = site_tag.find_next('a')['href'] if site_tag.find_next('a') else None
+    
+    return address, phones, website
+
+def extract_international_info(int_section):
+    if not int_section:
+        return None, None, set(), None
+
+    hq = extract_info_from_section(int_section, r'Штаб-квартира|Headquarters')
+    legal = extract_info_from_section(int_section, r'Юридический адрес|Legal Address')
+    
+    phones = set()
+    phone_tags = int_section.find_all(string=re.compile(r'Тел\.|Phone:', re.I))
+    for tag in phone_tags:
+        phones.update(PHONE_PATTERN.findall(tag))
+    
+    website = None
+    site_tag = int_section.find('a', href=True, string=re.compile(r'Веб-сайт|Website', re.I))
+    if site_tag:
+        website = site_tag['href']
+    else:
+        site_tag = int_section.find(string=re.compile(r'Веб-сайт|Website', re.I))
+        if site_tag:
+            website = site_tag.find_next('a')['href'] if site_tag.find_next('a') else None
+    
+    return hq, legal, phones, website
+
 def parse_federation_page(url):
     if is_invalid_link(url):
-        return None, None, None, None
+        return [None] * 9
 
-    response = requests.get(url)
-    if response.status_code != 200:
-        print(f"Ошибка: Не удалось загрузить страницу {url}. Код статуса: {response.status_code}")
-        return None, None, None, None
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200:
+            return [None] * 9
+    except Exception as e:
+        print(f"Ошибка при загрузке {url}: {str(e)}")
+        return [None] * 9
 
     soup = BeautifulSoup(response.text, 'html.parser')
+    
+    kz_section = soup.find(lambda tag: tag.name in ['div', 'section'] and re.search(r'Казахстанская федерация', tag.text, re.I))
+    int_section = soup.find(lambda tag: tag.name in ['div', 'section'] and re.search(r'Международная федерация|International Federation', tag.text, re.I))
 
-    # Поиск ссылок федераций
-    federation_items = soup.find_all('div', class_='game-header__desc-item')
-    kazakhstan_federation, international_federation = None, None
+    address_kz, phones_kz, website_kz = extract_kazakhstan_info(kz_section)
+    hq_int, legal_int, phones_int, website_int = extract_international_info(int_section)
 
-    if len(federation_items) >= 2:
-        first_link = federation_items[0].find('a', href=True)
-        second_link = federation_items[1].find('a', href=True)
+    president_kz = extract_info_from_section(kz_section, r'Президент') if kz_section else None
+    gen_sec = extract_info_from_section(kz_section, r'Генеральный секретарь') if kz_section else None
+    exec_dir = extract_info_from_section(kz_section, r'Исполнительный директор') if kz_section else None
+    president_int = extract_info_from_section(int_section, r'Президент') if int_section else None
 
-        if first_link and not is_invalid_link(first_link['href']):
-            kazakhstan_federation = first_link['href']
-        if second_link and not is_invalid_link(second_link['href']):
-            international_federation = second_link['href']
+    return (website_kz, website_int, president_kz, president_int, gen_sec, exec_dir, address_kz, hq_int, legal_int)
 
-    # Поиск президента Казахстанской федерации
-    president_kz = None
-
-    # 1. Проверяем <div> с классом person__desc (как на сайте)
-    president_kz_tag = soup.find('div', class_='person__desc')
-    if president_kz_tag:
-        name_tag = president_kz_tag.find('span', class_='person__name')
-        position_tag = president_kz_tag.find('span', class_='person__position')
-        if name_tag and position_tag and 'Президент' in position_tag.text:
-            president_kz = name_tag.text.strip()
-
-    # 2. Проверяем, если имя президента написано внутри <p><strong>Президент: ...</strong></p>
-    if not president_kz:
-        president_kz_tag = soup.find('p', string=re.compile(r'Президент:', re.I))
-        if president_kz_tag:
-            president_kz = president_kz_tag.text.replace("Президент:", "").strip()
-
-    # 3. Проверяем случай <div>ФИО Президент</div> (и убираем "Вице-президент"!)
-    if not president_kz:
-        all_divs = soup.find_all('div')
-        for div in all_divs:
-            text = div.get_text(strip=True)
-            if 'Президент' in text and 'Вице-президент' not in text and 'первый вице-президент' not in text.lower():
-                president_kz = re.sub(r'\b(Президент|Президент:)\b', '', text).strip()
-                break
-
-    # Убираем ошибки, если в тексте остаётся слишком много данных
-    if president_kz and len(president_kz) > 50:
-        president_kz = president_kz.split("\n")[0].strip()
-
-    # Поиск президента международной федерации
-    president_international = None
-    president_tags = soup.find_all('p')
-
-    for tag in president_tags:
-        text = tag.get_text(strip=True)
-        if 'Президент:' in text:
-            president_international = text.split('Президент:')[-1].strip()
-            break
-
-    return kazakhstan_federation, international_federation, president_kz, president_international
-
-# Функция для получения списка федераций и их ссылок
 def get_federation_links():
     url = 'https://olympic.kz/ru/federations'
     response = requests.get(url)
     if response.status_code != 200:
-        print(f"Ошибка: Не удалось загрузить главную страницу. Код статуса: {response.status_code}")
         return [], []
-
+    
     soup = BeautifulSoup(response.text, 'html.parser')
-
-    federations = soup.find_all('h3')
-    federation_names = [federation.text.strip() for federation in federations]
-
+    federations = [f.text.strip() for f in soup.find_all('h3')]
     links = []
-    federation_items = soup.find_all('a', class_='federations-list-item')
-
-    for item in federation_items:
+    
+    for item in soup.find_all('a', class_='federations-list-item'):
         link = item['href']
         if not link.startswith('http'):
-            link = 'https://olympic.kz' + link  # Добавляем базовый URL
+            link = 'https://olympic.kz' + link
+        if not is_invalid_link(link):
+            links.append(link)
+    
+    return federations, links
 
-        if is_invalid_link(link):
-            continue  # Пропускаем ненужные ссылки
-
-        links.append(link)
-
-    return federation_names, links
-
-# Основной код
 if __name__ == '__main__':
-    federation_names, federation_links = get_federation_links()
-    print(f"Найдено {len(federation_names)} федераций.")
-
-    for name, link in zip(federation_names, federation_links):
-        kazakhstan_link, international_link, president_kz, president_international = parse_federation_page(link)
-
+    names, links = get_federation_links()
+    print(f"Найдено {len(names)} федераций.")
+    
+    for name, link in zip(names, links):
+        data = parse_federation_page(link)
         print("----------------------------------------")
         print(f"Федерация: {name}")
         print("Казахстанская федерация:")
-        print(f"  Сайт: {kazakhstan_link if kazakhstan_link else 'Нет ссылки'}")
-        print(f"  Президент: {president_kz if president_kz else 'Нет информации'}")
+        print(f"  Сайт: {data[0] or 'Нет информации'}")
+        print(f"  Президент: {data[2] or 'Нет информации'}")
+        print(f"  Генеральный секретарь: {data[4] or 'Нет информации'}")
+        print(f"  Исполнительный директор: {data[5] or 'Нет информации'}")
+        print(f"  Юридический адрес: {data[6] or 'Нет информации'}")
         print("Международная федерация:")
-        print(f"  Сайт: {international_link if international_link else 'Нет ссылки'}")
-        print(f"  Президент: {president_international if president_international else 'Нет информации'}")
+        print(f"  Штаб-квартира: {data[7] or 'Нет информации'}")
+        print(f"  Юридический адрес: {data[8] or 'Нет информации'}")
         print("----------------------------------------")
-
